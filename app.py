@@ -1,456 +1,630 @@
 import streamlit as st
 import requests
-import json
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 import os
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import base64
-import pandas as pd
 from io import BytesIO
 import zipfile
+import re
 
-# Page configuration
+# ─────────────────────────────────────────────
+# Page Configuration
+# ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Bulk PDF Downloader",
+    page_title="Bulk PDF Downloader & Link Extractor",
     page_icon="📥",
     layout="wide"
 )
 
-# Initialize session state
-if 'download_results' not in st.session_state:
-    st.session_state.download_results = None
-if 'downloaded_files' not in st.session_state:
-    st.session_state.downloaded_files = []
+# ─────────────────────────────────────────────
+# Session State Initialization
+# ─────────────────────────────────────────────
+if 'found_pdfs' not in st.session_state:
+    st.session_state.found_pdfs = []
+if 'downloaded_pdfs' not in st.session_state:
+    st.session_state.downloaded_pdfs = {}  # filename -> bytes
+if 'txt_output' not in st.session_state:
+    st.session_state.txt_output = ""
+if 'scan_done' not in st.session_state:
+    st.session_state.scan_done = False
 
-class AdvancedDownloader:
-    """Handle both regular URLs and JSON API endpoints"""
+
+# ─────────────────────────────────────────────
+# Core Functions
+# ─────────────────────────────────────────────
+
+def get_session_with_headers():
+    """
+    Create a requests session that mimics a real browser.
+    This bypasses basic bot-detection on public websites.
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Accept': (
+            'text/html,application/xhtml+xml,'
+            'application/xml;q=0.9,*/*;q=0.8'
+        ),
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    })
+    return session
+
+
+def extract_pdf_links(url, session):
+    """
+    Given a webpage URL, fetch it and extract all PDF links.
     
-    def __init__(self, output_dir="streamlit_downloads"):
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-    
-    def get_chrome_driver(self, headless=True):
-        """Configure Chrome WebDriver"""
-        chrome_options = Options()
-        
-        if headless:
-            chrome_options.add_argument('--headless=new')
-        
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        return driver
-    
-    def download_from_json_api(self, api_url, headers=None, params=None):
-        """
-        Download data from JSON API endpoint
-        
-        Args:
-            api_url: API endpoint URL
-            headers: Optional headers (as dict)
-            params: Optional query parameters (as dict)
-        """
-        try:
-            # Parse headers if string
-            if headers and isinstance(headers, str):
-                try:
-                    headers = json.loads(headers)
-                except:
-                    # Try to parse as key:value format
-                    headers_dict = {}
-                    for line in headers.strip().split('\n'):
-                        if ':' in line:
-                            key, value = line.split(':', 1)
-                            headers_dict[key.strip()] = value.strip()
-                    headers = headers_dict
-            
-            # Make request
-            response = requests.get(api_url, headers=headers, params=params, timeout=30)
-            response.raise_for_status()
-            
-            # Try to parse as JSON
-            try:
-                data = response.json()
-                return {'success': True, 'data': data, 'type': 'json'}
-            except:
-                # Return raw content if not JSON
-                return {'success': True, 'data': response.text, 'type': 'text'}
-                
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
-    
-    def download_page_to_pdf(self, url, filename, wait_time=5, progress_callback=None):
-        """Download webpage and convert to PDF"""
-        driver = None
-        try:
-            if progress_callback:
-                progress_callback(f"Loading: {url}")
-            
-            driver = self.get_chrome_driver(headless=True)
-            driver.get(url)
-            time.sleep(wait_time)
-            
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+    Strategy:
+    1. Fetch page HTML
+    2. Parse all <a> tags with href ending in .pdf
+    3. Also check for links containing 'download' or 'pdf' 
+       in query params
+    4. Return list of absolute PDF URLs
+    """
+    pdf_links = []
+
+    try:
+        response = session.get(url, timeout=30, allow_redirects=True)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to fetch page: {e}")
+        return pdf_links
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    # ── Find all anchor tags ──
+    for tag in soup.find_all('a', href=True):
+        href = tag['href'].strip()
+
+        # Skip empty, javascript, and anchor-only links
+        if not href or href.startswith('#') or href.startswith('javascript'):
+            continue
+
+        # Convert to absolute URL
+        absolute_url = urljoin(url, href)
+
+        # ── Check if link points to a PDF ──
+        # Method 1: URL path ends with .pdf
+        parsed = urlparse(absolute_url)
+        path_lower = parsed.path.lower()
+
+        if path_lower.endswith('.pdf'):
+            pdf_links.append(absolute_url)
+            continue
+
+        # Method 2: Query params contain .pdf
+        if '.pdf' in parsed.query.lower():
+            pdf_links.append(absolute_url)
+            continue
+
+        # Method 3: Link text or title suggests PDF
+        link_text = tag.get_text(strip=True).lower()
+        title = tag.get('title', '').lower()
+        onclick = tag.get('onclick', '').lower()
+
+        if any(
+            keyword in attr
+            for keyword in ['pdf', 'download', 'annual report', 'quarterly']
+            for attr in [link_text, title, onclick]
+        ):
+            # Only add if URL looks like it could serve a file
+            if any(
+                ext in absolute_url.lower()
+                for ext in ['.pdf', 'download', 'getfile', 'document']
+            ):
+                pdf_links.append(absolute_url)
+
+    # ── Also check for embedded objects / iframes ──
+    for tag in soup.find_all(['embed', 'iframe', 'object'], src=True):
+        src = tag.get('src', '') or tag.get('data', '')
+        if src and '.pdf' in src.lower():
+            pdf_links.append(urljoin(url, src))
+
+    # ── Deduplicate while preserving order ──
+    seen = set()
+    unique_links = []
+    for link in pdf_links:
+        if link not in seen:
+            seen.add(link)
+            unique_links.append(link)
+
+    return unique_links
+
+
+def download_single_pdf(pdf_url, session, index):
+    """
+    Download a single PDF file. Returns tuple of
+    (filename, bytes_content, success_bool, error_msg).
+    """
+    try:
+        response = session.get(pdf_url, timeout=60, stream=True)
+        response.raise_for_status()
+
+        # ── Determine filename ──
+        # Try Content-Disposition header first
+        filename = None
+        cd = response.headers.get('Content-Disposition', '')
+        if 'filename' in cd:
+            # Extract filename from header
+            match = re.findall(r'filename[^;=\n]*=([\"\']?)(.+?)\1(;|$)', cd)
+            if match:
+                filename = match[0][1].strip()
+
+        # Fallback: extract from URL path
+        if not filename:
+            parsed_path = urlparse(pdf_url).path
+            filename = os.path.basename(parsed_path)
+
+        # Fallback: generate generic name
+        if not filename or not filename.endswith('.pdf'):
+            filename = f"document_{index:03d}.pdf"
+
+        # ── Clean filename ──
+        # Remove special characters that break file systems
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        filename = filename.strip()
+
+        # ── Read content ──
+        content = response.content
+
+        # ── Verify it's actually a PDF ──
+        content_type = response.headers.get('Content-Type', '').lower()
+        is_pdf = (
+            content[:4] == b'%PDF'
+            or 'pdf' in content_type
+        )
+
+        if not is_pdf:
+            return (filename, None, False, "Not a valid PDF file")
+
+        return (filename, content, True, None)
+
+    except Exception as e:
+        return (f"document_{index:03d}.pdf", None, False, str(e))
+
+
+def download_all_pdfs(pdf_urls, session, max_workers=5, progress_bar=None):
+    """
+    Download all PDFs in parallel.
+    Returns dict of {filename: bytes} for successful downloads.
+    """
+    downloaded = {}
+    errors = []
+    total = len(pdf_urls)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                download_single_pdf, url, session, idx
+            ): (url, idx)
+            for idx, url in enumerate(pdf_urls, 1)
+        }
+
+        completed = 0
+        for future in as_completed(future_map):
+            url, idx = future_map[future]
+            filename, content, success, error = future.result()
+
+            completed += 1
+            if progress_bar:
+                progress_bar.progress(
+                    completed / total,
+                    text=f"Downloading {completed}/{total}: {filename}"
                 )
-            except:
-                pass
-            
-            if not filename.endswith('.pdf'):
-                filename += '.pdf'
-            
-            filepath = os.path.join(self.output_dir, filename)
-            
-            # Generate PDF
-            pdf_data = driver.execute_cdp_cmd("Page.printToPDF", {
-                "printBackground": True,
-                "landscape": False,
-                "paperWidth": 8.27,
-                "paperHeight": 11.69,
-                "marginTop": 0.4,
-                "marginBottom": 0.4,
-                "marginLeft": 0.4,
-                "marginRight": 0.4,
-                "displayHeaderFooter": False,
-                "preferCSSPageSize": True
-            })
-            
-            with open(filepath, 'wb') as f:
-                f.write(base64.b64decode(pdf_data['data']))
-            
-            if progress_callback:
-                progress_callback(f"✓ Saved: {filename}")
-            
-            return {'success': True, 'url': url, 'filepath': filepath, 'filename': filename}
-            
-        except Exception as e:
-            return {'success': False, 'url': url, 'error': str(e)}
-            
-        finally:
-            if driver:
-                driver.quit()
-    
-    def save_json_to_file(self, data, filename):
-        """Save JSON data to file"""
-        try:
-            if not filename.endswith('.json'):
-                filename += '.json'
-            
-            filepath = os.path.join(self.output_dir, filename)
-            
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            
-            return {'success': True, 'filepath': filepath, 'filename': filename}
-            
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
 
-def create_zip_file(file_paths):
-    """Create a zip file containing all downloaded files"""
+            if success and content:
+                # Handle duplicate filenames
+                original_name = filename
+                counter = 1
+                while filename in downloaded:
+                    name, ext = os.path.splitext(original_name)
+                    filename = f"{name}_{counter}{ext}"
+                    counter += 1
+
+                downloaded[filename] = content
+            else:
+                errors.append({
+                    'url': url,
+                    'filename': filename,
+                    'error': error
+                })
+
+    return downloaded, errors
+
+
+def create_zip_from_memory(files_dict):
+    """
+    Create ZIP file in memory from dict of {filename: bytes}.
+    """
     zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for file_path in file_paths:
-            if os.path.exists(file_path):
-                zip_file.write(file_path, os.path.basename(file_path))
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for filename, content in files_dict.items():
+            zf.writestr(filename, content)
     zip_buffer.seek(0)
     return zip_buffer
 
-# Main Streamlit UI
-st.title("📥 Advanced Bulk PDF Downloader")
-st.markdown("Download web pages as PDFs or fetch data from JSON APIs found in Network tab")
 
-# Tabs for different input methods
-tab1, tab2, tab3 = st.tabs(["📄 Web Pages to PDF", "🔌 JSON API Endpoints", "📊 Upload CSV/Excel"])
+def generate_txt_report(page_url, pdf_links, downloaded, errors):
+    """
+    Generate a .txt file listing all found PDF URLs
+    and download status.
+    """
+    lines = []
+    lines.append("=" * 70)
+    lines.append("BULK PDF DOWNLOAD REPORT")
+    lines.append("=" * 70)
+    lines.append(f"Source Page : {page_url}")
+    lines.append(f"Scan Date  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Total Found: {len(pdf_links)}")
+    lines.append(f"Downloaded : {len(downloaded)}")
+    lines.append(f"Failed     : {len(errors)}")
+    lines.append("=" * 70)
+    lines.append("")
 
-# ==================== TAB 1: Web Pages ====================
+    lines.append("─── ALL PDF LINKS FOUND ───")
+    lines.append("")
+    for i, link in enumerate(pdf_links, 1):
+        lines.append(f"  {i:3d}. {link}")
+    lines.append("")
+
+    if downloaded:
+        lines.append("─── SUCCESSFULLY DOWNLOADED ───")
+        lines.append("")
+        for filename in sorted(downloaded.keys()):
+            size_kb = len(downloaded[filename]) / 1024
+            lines.append(f"  ✓ {filename} ({size_kb:.1f} KB)")
+        lines.append("")
+
+    if errors:
+        lines.append("─── FAILED DOWNLOADS ───")
+        lines.append("")
+        for err in errors:
+            lines.append(f"  ✗ {err['url']}")
+            lines.append(f"    Error: {err['error']}")
+        lines.append("")
+
+    lines.append("=" * 70)
+    lines.append("END OF REPORT")
+    lines.append("=" * 70)
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# STREAMLIT UI
+# ─────────────────────────────────────────────
+
+st.title("📥 Bulk PDF Downloader & Link Extractor")
+st.markdown(
+    "Paste a webpage URL → App finds **all PDF links** → "
+    "Downloads them in bulk → Gives you **ZIP + TXT report**"
+)
+
+# ── Main Tabs ──
+tab1, tab2 = st.tabs([
+    "🔍 Scan & Download from Webpage",
+    "📋 Paste PDF URLs Directly"
+])
+
+# ════════════════════════════════════════════
+# TAB 1: SCAN WEBPAGE FOR PDFs
+# ════════════════════════════════════════════
 with tab1:
-    st.header("Convert Web Pages to PDF")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        urls_input = st.text_area(
-            "Enter URLs (one per line)",
-            height=200,
-            placeholder="https://example.com/page1\nhttps://example.com/page2\nhttps://example.com/page3",
-            help="Paste URLs from your browser. Each URL on a new line."
-        )
-    
-    with col2:
-        st.markdown("### Settings")
-        wait_time = st.slider("Wait time per page (seconds)", 3, 15, 5)
-        parallel = st.slider("Parallel downloads", 1, 5, 3)
-        auto_filename = st.checkbox("Auto-generate filenames", value=True)
-        
-        if not auto_filename:
-            st.info("You'll need to provide filenames in format: URL|filename.pdf")
-    
-    if st.button("🚀 Download All Pages", key="download_pages"):
-        if not urls_input.strip():
-            st.error("Please enter at least one URL!")
-        else:
-            # Parse URLs
-            urls_dict = {}
-            lines = [line.strip() for line in urls_input.split('\n') if line.strip()]
-            
-            for i, line in enumerate(lines, 1):
-                if '|' in line and not auto_filename:
-                    url, filename = line.split('|', 1)
-                    urls_dict[url.strip()] = filename.strip()
-                else:
-                    url = line.strip()
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"page_{i:03d}_{timestamp}.pdf"
-                    urls_dict[url] = filename
-            
-            # Download
-            downloader = AdvancedDownloader()
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            results = {'successful': [], 'failed': []}
-            total = len(urls_dict)
-            
-            with ThreadPoolExecutor(max_workers=parallel) as executor:
-                futures = {
-                    executor.submit(
-                        downloader.download_page_to_pdf, 
-                        url, 
-                        filename, 
-                        wait_time
-                    ): (url, filename) 
-                    for url, filename in urls_dict.items()
-                }
-                
-                completed = 0
-                for future in as_completed(futures):
-                    result = future.result()
-                    completed += 1
-                    progress_bar.progress(completed / total)
-                    
-                    if result['success']:
-                        results['successful'].append(result)
-                        status_text.text(f"✓ Downloaded: {result['filename']}")
-                    else:
-                        results['failed'].append(result)
-                        status_text.text(f"✗ Failed: {result['url']}")
-            
-            st.session_state.download_results = results
-            st.session_state.downloaded_files = [r['filepath'] for r in results['successful']]
-            
-            # Show results
-            st.success(f"✅ Downloaded {len(results['successful'])} of {total} pages")
-            
-            if results['failed']:
-                st.warning(f"❌ Failed: {len(results['failed'])} pages")
-                with st.expander("Show failed downloads"):
-                    for item in results['failed']:
-                        st.text(f"❌ {item['url']}: {item['error']}")
-
-# ==================== TAB 2: JSON APIs ====================
-with tab2:
-    st.header("Fetch Data from JSON API")
-    st.markdown("Perfect for API endpoints found in Network tab (F12 → Network)")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        api_url = st.text_input(
-            "API Endpoint URL",
-            placeholder="https://api.example.com/data",
-            help="Copy the URL from Network tab in browser DevTools"
-        )
-        
-        headers_input = st.text_area(
-            "Headers (optional)",
-            height=150,
-            placeholder='{\n  "Authorization": "Bearer token",\n  "Content-Type": "application/json"\n}\n\nOr paste from Network tab:\nAuthorization: Bearer token\nContent-Type: application/json',
-            help="Copy headers from Network tab or paste as JSON"
-        )
-    
-    with col2:
-        st.markdown("### Output Format")
-        output_format = st.radio(
-            "Save as:",
-            ["JSON file", "View in browser", "Both"]
-        )
-        
-        output_filename = st.text_input(
-            "Output filename",
-            value="api_response.json"
-        )
-    
-    if st.button("🔌 Fetch API Data", key="fetch_api"):
-        if not api_url:
-            st.error("Please enter an API URL!")
-        else:
-            with st.spinner("Fetching data..."):
-                downloader = AdvancedDownloader()
-                result = downloader.download_from_json_api(api_url, headers_input)
-                
-                if result['success']:
-                    st.success("✅ Data fetched successfully!")
-                    
-                    if output_format in ["JSON file", "Both"]:
-                        save_result = downloader.save_json_to_file(
-                            result['data'], 
-                            output_filename
-                        )
-                        if save_result['success']:
-                            st.session_state.downloaded_files.append(save_result['filepath'])
-                            st.info(f"💾 Saved to: {save_result['filename']}")
-                    
-                    if output_format in ["View in browser", "Both"]:
-                        st.markdown("### Response Data:")
-                        st.json(result['data'])
-                else:
-                    st.error(f"❌ Error: {result['error']}")
-
-# ==================== TAB 3: CSV/Excel Upload ====================
-with tab3:
-    st.header("Upload CSV/Excel File")
-    st.markdown("Upload a file with columns: `url`, `filename`, `wait_time` (optional)")
-    
-    uploaded_file = st.file_uploader(
-        "Choose a CSV or Excel file",
-        type=['csv', 'xlsx', 'xls']
+    st.header("Step 1: Enter Webpage URL")
+    st.markdown(
+        "Paste the investor/documents page URL. "
+        "The app will scan it and find all PDF links."
     )
-    
-    if uploaded_file:
-        try:
-            # Read file
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            else:
-                df = pd.read_excel(uploaded_file)
-            
-            st.markdown("### Preview:")
-            st.dataframe(df.head())
-            
-            if st.button("🚀 Download from File", key="download_csv"):
-                downloader = AdvancedDownloader()
-                
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                results = {'successful': [], 'failed': []}
-                total = len(df)
-                
-                for idx, row in df.iterrows():
-                    url = row.get('url', '')
-                    filename = row.get('filename', f'page_{idx+1}.pdf')
-                    wait = int(row.get('wait_time', 5))
-                    
-                    if url and not url.startswith('http'):
-                        continue
-                    
-                    status_text.text(f"Downloading: {filename}")
-                    result = downloader.download_page_to_pdf(url, filename, wait)
-                    
-                    if result['success']:
-                        results['successful'].append(result)
-                        st.session_state.downloaded_files.append(result['filepath'])
-                    else:
-                        results['failed'].append(result)
-                    
-                    progress_bar.progress((idx + 1) / total)
-                
-                st.session_state.download_results = results
-                st.success(f"✅ Downloaded {len(results['successful'])} of {total} pages")
-                
-        except Exception as e:
-            st.error(f"Error reading file: {str(e)}")
 
-# ==================== DOWNLOAD SECTION ====================
-if st.session_state.downloaded_files:
-    st.markdown("---")
-    st.header("📦 Download Your Files")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown(f"**Total Files: {len(st.session_state.downloaded_files)}**")
-        
-        # List files
-        with st.expander("📄 Show all files"):
-            for filepath in st.session_state.downloaded_files:
-                st.text(f"✓ {os.path.basename(filepath)}")
-    
-    with col2:
-        # Create zip
-        if st.button("📦 Download All as ZIP"):
-            zip_buffer = create_zip_file(st.session_state.downloaded_files)
-            st.download_button(
-                label="⬇️ Download ZIP",
-                data=zip_buffer,
-                file_name=f"bulk_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip"
+    page_url = st.text_input(
+        "Webpage URL",
+        placeholder="https://www.shriramfinance.in/investors/investor-information",
+        help="Paste the page that contains PDF download links"
+    )
+
+    col_settings_1, col_settings_2 = st.columns(2)
+    with col_settings_1:
+        max_workers = st.slider(
+            "Parallel downloads", 1, 10, 5,
+            help="Higher = faster but more resource intensive"
+        )
+    with col_settings_2:
+        timeout_seconds = st.slider(
+            "Timeout per PDF (seconds)", 15, 120, 60
+        )
+
+    # ── SCAN BUTTON ──
+    if st.button("🔍 Scan for PDFs", key="scan_page", type="primary"):
+        if not page_url.strip():
+            st.error("Please enter a URL!")
+        else:
+            with st.spinner("Scanning page for PDF links..."):
+                session = get_session_with_headers()
+                found = extract_pdf_links(page_url.strip(), session)
+
+            if found:
+                st.session_state.found_pdfs = found
+                st.session_state.scan_done = True
+                st.success(f"✅ Found **{len(found)}** PDF links!")
+            else:
+                st.warning(
+                    "No PDF links found on this page. "
+                    "The site might load PDFs via JavaScript. "
+                    "Try Tab 2 to paste URLs directly."
+                )
+                st.session_state.found_pdfs = []
+                st.session_state.scan_done = False
+
+    # ── SHOW FOUND PDFs ──
+    if st.session_state.scan_done and st.session_state.found_pdfs:
+        st.header("Step 2: Review Found PDFs")
+
+        # Show as dataframe for easy review
+        pdf_data = []
+        for i, link in enumerate(st.session_state.found_pdfs, 1):
+            parsed = urlparse(link)
+            name = os.path.basename(parsed.path) or f"document_{i}.pdf"
+            pdf_data.append({
+                "Select": True,
+                "#": i,
+                "Filename": name,
+                "URL": link
+            })
+
+        # Let user see all links
+        with st.expander(
+            f"📄 View all {len(st.session_state.found_pdfs)} PDF links",
+            expanded=True
+        ):
+            for item in pdf_data:
+                st.text(f"{item['#']:3d}. {item['Filename']}")
+                st.caption(f"     {item['URL']}")
+
+        # ── Quick TXT download of just the links ──
+        txt_links = "\n".join(st.session_state.found_pdfs)
+        st.download_button(
+            label="📝 Download PDF Links as .TXT",
+            data=txt_links,
+            file_name=f"pdf_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            mime="text/plain",
+            help="Just the list of PDF URLs, one per line"
+        )
+
+        st.header("Step 3: Download All PDFs")
+
+        if st.button(
+            f"⬇️ Download All {len(st.session_state.found_pdfs)} PDFs",
+            key="download_all",
+            type="primary"
+        ):
+            session = get_session_with_headers()
+            progress_bar = st.progress(0, text="Starting downloads...")
+            status_container = st.empty()
+
+            downloaded, errors = download_all_pdfs(
+                st.session_state.found_pdfs,
+                session,
+                max_workers=max_workers,
+                progress_bar=progress_bar
             )
-    
-    # Individual downloads
-    st.markdown("### Download Individual Files")
-    for filepath in st.session_state.downloaded_files[:5]:  # Show first 5
-        if os.path.exists(filepath):
-            with open(filepath, 'rb') as f:
+
+            progress_bar.progress(1.0, text="Done!")
+
+            # Store results
+            st.session_state.downloaded_pdfs = downloaded
+
+            # Generate report
+            report_txt = generate_txt_report(
+                page_url,
+                st.session_state.found_pdfs,
+                downloaded,
+                errors
+            )
+            st.session_state.txt_output = report_txt
+
+            # ── Show Results ──
+            col_r1, col_r2 = st.columns(2)
+            with col_r1:
+                st.metric("✅ Downloaded", len(downloaded))
+            with col_r2:
+                st.metric("❌ Failed", len(errors))
+
+            if errors:
+                with st.expander("Show failed downloads"):
+                    for err in errors:
+                        st.text(f"✗ {err['url']}")
+                        st.caption(f"  Error: {err['error']}")
+
+            # ── DOWNLOAD BUTTONS ──
+            st.markdown("---")
+            st.header("📦 Get Your Files")
+
+            dl_col1, dl_col2, dl_col3 = st.columns(3)
+
+            with dl_col1:
+                if downloaded:
+                    zip_data = create_zip_from_memory(downloaded)
+                    st.download_button(
+                        label=f"📦 Download ZIP ({len(downloaded)} PDFs)",
+                        data=zip_data,
+                        file_name=(
+                            f"pdfs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                        ),
+                        mime="application/zip",
+                        type="primary"
+                    )
+
+            with dl_col2:
                 st.download_button(
-                    label=f"⬇️ {os.path.basename(filepath)}",
-                    data=f,
-                    file_name=os.path.basename(filepath),
-                    mime="application/pdf" if filepath.endswith('.pdf') else "application/json"
+                    label="📝 Download Report (.TXT)",
+                    data=report_txt,
+                    file_name=(
+                        f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                    ),
+                    mime="text/plain"
                 )
 
-# ==================== SIDEBAR ====================
+            with dl_col3:
+                # Individual file list
+                with st.expander("Download individual PDFs"):
+                    for fname, content in downloaded.items():
+                        size_kb = len(content) / 1024
+                        st.download_button(
+                            label=f"⬇️ {fname} ({size_kb:.1f} KB)",
+                            data=content,
+                            file_name=fname,
+                            mime="application/pdf",
+                            key=f"dl_{fname}"
+                        )
+
+
+# ════════════════════════════════════════════
+# TAB 2: PASTE PDF URLs DIRECTLY
+# ════════════════════════════════════════════
+with tab2:
+    st.header("Paste PDF URLs Directly")
+    st.markdown(
+        "If the webpage uses JavaScript to load PDFs and "
+        "auto-scan didn't work, paste PDF URLs here manually."
+    )
+
+    direct_urls = st.text_area(
+        "PDF URLs (one per line)",
+        height=250,
+        placeholder=(
+            "https://example.com/report1.pdf\n"
+            "https://example.com/report2.pdf\n"
+            "https://example.com/annual-report-2024.pdf"
+        )
+    )
+
+    direct_workers = st.slider(
+        "Parallel downloads",
+        1, 10, 5,
+        key="direct_workers"
+    )
+
+    if st.button("⬇️ Download All", key="download_direct", type="primary"):
+        urls = [
+            u.strip()
+            for u in direct_urls.strip().split('\n')
+            if u.strip()
+        ]
+
+        if not urls:
+            st.error("Please paste at least one URL!")
+        else:
+            session = get_session_with_headers()
+            progress_bar = st.progress(0, text="Starting...")
+
+            downloaded, errors = download_all_pdfs(
+                urls,
+                session,
+                max_workers=direct_workers,
+                progress_bar=progress_bar
+            )
+
+            progress_bar.progress(1.0, text="Done!")
+
+            report_txt = generate_txt_report(
+                "Direct URL input",
+                urls,
+                downloaded,
+                errors
+            )
+
+            st.success(f"✅ Downloaded {len(downloaded)} of {len(urls)} PDFs")
+
+            if errors:
+                with st.expander("Show errors"):
+                    for err in errors:
+                        st.text(f"✗ {err['url']}: {err['error']}")
+
+            dl_c1, dl_c2 = st.columns(2)
+
+            with dl_c1:
+                if downloaded:
+                    zip_data = create_zip_from_memory(downloaded)
+                    st.download_button(
+                        label=f"📦 Download ZIP ({len(downloaded)} files)",
+                        data=zip_data,
+                        file_name=(
+                            f"pdfs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                        ),
+                        mime="application/zip",
+                        type="primary"
+                    )
+
+            with dl_c2:
+                st.download_button(
+                    label="📝 Download Report (.TXT)",
+                    data=report_txt,
+                    file_name=(
+                        f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                    ),
+                    mime="text/plain"
+                )
+
+
+# ─────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────
 with st.sidebar:
     st.header("ℹ️ How to Use")
-    
+
     st.markdown("""
-    ### 📄 Web Pages to PDF
-    1. Paste URLs (one per line)
-    2. Adjust settings
-    3. Click "Download All Pages"
-    
-    ### 🔌 JSON API Endpoints
-    1. Open DevTools (F12) → Network tab
-    2. Find the API call
-    3. Right-click → Copy → Copy URL
-    4. Paste here and fetch!
-    
-    ### 📊 CSV Upload
-    Format your CSV:
+    ### 🔍 Auto-Scan Mode (Tab 1)
+    1. Go to the company's investor page
+    2. Copy the URL from your browser
+    3. Paste it here
+    4. Click **Scan for PDFs**
+    5. Review found links
+    6. Click **Download All PDFs**
+    7. Get your **ZIP** + **TXT report**
+
+    ### 📋 Manual Mode (Tab 2)
+    If auto-scan doesn't find PDFs
+    (JavaScript-heavy sites):
+    1. Open browser DevTools (F12)
+    2. Go to **Network** tab
+    3. Filter by **Doc** or search **.pdf**
+    4. Copy all PDF URLs
+    5. Paste them in Tab 2
+    6. Download in bulk
+
+    ---
+
+    ### 🎯 Example URLs to Try
     ```
-    url,filename,wait_time
-    https://...,page1.pdf,5
-    https://...,page2.pdf,7
+    https://www.shriramfinance.in/
+    investors/investor-information
     ```
+
+    ---
+
+    ### ⚡ Why This Works
+    - **No Selenium needed** — pure HTTP requests
+    - **Browser-like headers** bypass basic blocks
+    - **Parallel downloads** — 5-10x faster
+    - **Works on Streamlit Cloud**
+    - **ZIP + TXT output** ready to use
     """)
-    
+
     st.markdown("---")
-    st.markdown("### 🎯 Tips")
-    st.markdown("""
-    - Increase wait time for slow pages
-    - Use 2-3 parallel downloads
-    - For APIs, copy headers from Network tab
-    - Download as ZIP for bulk files
-    """)
-    
-    if st.button("🗑️ Clear All Downloads"):
-        st.session_state.downloaded_files = []
-        st.session_state.download_results = None
+
+    if st.button("🗑️ Clear Everything"):
+        st.session_state.found_pdfs = []
+        st.session_state.downloaded_pdfs = {}
+        st.session_state.txt_output = ""
+        st.session_state.scan_done = False
         st.rerun()
